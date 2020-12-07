@@ -99,6 +99,7 @@
 
 -export([setup_ets/1, cleanup_ets/1, set_ring_global/1]). %% For EUnit testing
 -ifdef(TEST).
+-export([do_write_ringfile_with_datetime/3, reload_ring/1]).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
@@ -231,13 +232,16 @@ do_write_ringfile(Ring) ->
     case ring_dir() of
         "<nostore>" -> nop;
         Dir ->
-            {{Year, Month, Day},{Hour, Minute, Second}} = calendar:universal_time(),
-            TS = io_lib:format(".~B~2.10.0B~2.10.0B~2.10.0B~2.10.0B~2.10.0B",
-                               [Year, Month, Day, Hour, Minute, Second]),
-            Cluster = app_helper:get_env(riak_core, cluster_name),
-            FN = Dir ++ "/riak_core_ring." ++ Cluster ++ TS,
-            do_write_ringfile(Ring, FN)
+            do_write_ringfile_with_datetime(Ring, Dir, calendar:universal_time())
     end.
+
+do_write_ringfile_with_datetime(Ring, Dir, DateTime) ->
+    {{Year, Month, Day},{Hour, Minute, Second}} = DateTime,
+    TS = io_lib:format(".~B~2.10.0B~2.10.0B~2.10.0B~2.10.0B~2.10.0B",
+                    [Year, Month, Day, Hour, Minute, Second]),
+    Cluster = app_helper:get_env(riak_core, cluster_name),
+    FN = Dir ++ "/riak_core_ring." ++ Cluster ++ TS,
+    do_write_ringfile(Ring, FN).
 
 do_write_ringfile(Ring, FN) ->
     ok = filelib:ensure_dir(FN),
@@ -268,6 +272,21 @@ find_latest_ringfile() ->
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+find_ringfiles_newest_first() ->
+    Dir = ring_dir(),
+    case file:list_dir(Dir) of
+        {ok, Filenames} ->
+            Cluster = app_helper:get_env(riak_core, cluster_name),
+            Timestamps = [list_to_integer(TS) || {"riak_core_ring", C1, TS} <-
+                                                     [list_to_tuple(string:tokens(FN, ".")) || FN <- Filenames],
+                                                 C1 =:= Cluster],
+            SortedTimestamps = lists:reverse(lists:sort(Timestamps)),
+            SortedFiles = [Dir ++ "/riak_core_ring." ++ Cluster ++ "." ++ integer_to_list(STS) || STS <- SortedTimestamps],
+            {ok, SortedFiles};
+        {error, Reason} ->
+            throw({error, Reason})
     end.
 
 %% @spec read_ringfile(string()) -> riak_core_ring:riak_core_ring() | {error, any()}
@@ -338,30 +357,40 @@ init([Mode]) ->
 reload_ring(test) ->
     riak_core_ring:fresh(16,node());
 reload_ring(live) ->
-    case riak_core_ring_manager:find_latest_ringfile() of
-        {ok, RingFile} ->
-            case riak_core_ring_manager:read_ringfile(RingFile) of
-                {error, Reason} ->
-                    lager:critical("Failed to read ring file: ~p",
-                                   [lager:posix_error(Reason)]),
-                    throw({error, Reason});
-                Ring ->
-                    %% Upgrade the ring data structure if necessary.
-                    case riak_core_ring:legacy_ring(Ring) of
-                        true ->
-                            lager:info("Upgrading legacy ring"),
-                            riak_core_ring:upgrade(Ring);
-                        false ->
-                            Ring
-                    end
-            end;
-        {error, not_found} ->
+    case find_ringfiles_newest_first() of
+        {ok, []} ->
             lager:warning("No ring file available."),
             riak_core_ring:fresh();
+        {ok, RingFiles} ->
+            reload_ring_from_files(RingFiles);
         {error, Reason} ->
-            lager:critical("Failed to load ring file: ~p",
-                           [lager:posix_error(Reason)]),
-            throw({error, Reason})
+            {error, Reason}
+    end.
+
+reload_ring_from_files([NewestFile|OlderRingFiles]) ->
+    try reload_ring_from_file(live, NewestFile) of
+        Ring -> Ring
+    catch
+        error:badarg -> reload_ring_from_files(OlderRingFiles)
+    end;
+reload_ring_from_files([]) ->
+    error(badarg).
+
+reload_ring_from_file(live, RingFile) ->
+    case riak_core_ring_manager:read_ringfile(RingFile) of
+        {error, Reason} ->
+            lager:critical("Failed to read ring file: ~p",
+                            [lager:posix_error(Reason)]),
+            throw({error, Reason});
+        Ring ->
+            %% Upgrade the ring data structure if necessary.
+            case riak_core_ring:legacy_ring(Ring) of
+                true ->
+                    lager:info("Upgrading legacy ring"),
+                    riak_core_ring:upgrade(Ring);
+                false ->
+                    Ring
+            end
     end.
 
 handle_call(get_raw_ring, _From, #state{raw_ring=Ring} = State) ->
